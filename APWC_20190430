@@ -1,0 +1,237 @@
+/*
+Active‐Passive Surface Water Classification
+Kimberly Slinski, 2019
+Please cite: 
+Slinski, K. M., Hogue, T. S., & McCray, J. E. (2019). Active‐Passive Surface Water Classification: A New Method for High Resolution Monitoring of Surface Water Dynamics. Geophysical Research Letters, 46. https://doi.org/10.1029/2019GL082562
+This script is written for the Google Earth Engine java script code editor.
+*/
+// -----------------------------------------------------------------
+//              Region of Interest
+// -----------------------------------------------------------------
+var ROI = ee.FeatureCollection('ft:12D6awes8AQ8BzI_79F9rISEpJ9tLkeh2rMYmaMow').geometry();
+var lon= ee.Number(ee.Feature(ROI.centroid(100)).geometry().coordinates().get(0));
+var lat= ee.Number(ee.Feature(ROI.centroid(100)).geometry().coordinates().get(1));
+Map.setCenter(lon.getInfo(), lat.getInfo(), 7);
+
+// -----------------------------------------------------------------
+//              Permanent Waterbody Mask
+// -----------------------------------------------------------------
+var dataset = ee.Image('JRC/GSW1_0/GlobalSurfaceWater');
+var perm = dataset.select('transition');
+var perm = perm.updateMask(perm.eq(1));
+var perm = perm.reduceToVectors({
+  geometry: ROI, 
+  geometryType: 'polygon',
+  scale: 100,
+  maxPixels: 1e8
+});
+
+// If get "too many pixels" error or the wrong cluster is being selected use:
+//var perm = polygon.geometry();  
+// where polygon = a polygon drawn over an area of permanant water within the ROI (e.g., a perrenial lake) 
+
+// -----------------------------------------------------------------
+//              Global variables
+// -----------------------------------------------------------------
+// SAR
+var Sen1 = 'COPERNICUS/S1_GRD';
+var pol = 'VV'; 
+var instr = 'IW';
+var res = 10;
+
+// Landsat
+var LS8 = 'LANDSAT/LC08/C01/T1_SR';
+var LS7 = 'LANDSAT/LE07/C01/T1_SR';
+
+var clnum = 5;  // Number of clusters
+
+// -----------------------------------------------------------------
+//              Color Palettes for Visualization
+// -----------------------------------------------------------------
+var vis_MNDWI = {
+  palette: ['00FFFF', '0000FF'],
+  min: [-1],
+  max: [1]
+};
+
+var vis_SAR = {
+  palette: ['#3f007d','#efedf5'],
+  min: [-20],
+  max: [-5]
+};
+
+var vis_WB = {
+  min:0,
+  max:1,
+  palette: ['#fff7f3', '#dd3497']
+};
+
+// -----------------------------------------------------------------
+//              SAR Functions
+// -----------------------------------------------------------------
+// Function to mask border noise
+function maskEdge(img) {
+  var clipped = img.clip(img.geometry().buffer(-5000));
+  var mask = img.select(0).unitScale(-25, 5).multiply(255).toByte().connectedComponents(ee.Kernel.rectangle(1,1), 256);
+  var masked = img.updateMask(mask.select(0)).unmask(clipped, false);
+  var mask2 = masked.mask();
+  var mask3 = mask2.focal_min(20, 'plus', 'meters');
+  return img.updateMask(mask3);
+}
+
+// Function to generate SAR median image (+/-15 days)
+var SAR_process = function(Sen1, d, ROI){
+  var date = d;
+  var start = ee.Date.parse('yyyy-MM-dd', d).advance(-15, 'day');
+  var end = ee.Date.parse('yyyy-MM-dd', d).advance(15, 'day');
+  
+  var SAR = ee.ImageCollection(Sen1)
+    .filterBounds(ROI)
+    .filterDate(start, end)
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', pol))
+    .filter(ee.Filter.eq('instrumentMode', instr))
+    .filter(ee.Filter.eq('resolution_meters', res))
+    .map(function(img) {return maskEdge(img);})
+    .select('VV');
+  
+  return(SAR.median());
+};
+
+// -----------------------------------------------------------------
+//              Landsat Functions
+// -----------------------------------------------------------------
+// Function to mask cloud pixels.
+var maskIm = function(image) {
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  var qa = image.select('pixel_qa');
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// Functions to calculate MNDWI
+var DI_LS8 = function(image) {
+  var index = image.normalizedDifference(['B3','B6']);
+  var index = index.rename('MNDWI');
+  return image.addBands(index);
+};
+
+var DI_LS7 = function(image) {
+  var index = image.normalizedDifference(['B2','B5']);
+  var index = index.rename('MNDWI');
+  return image.addBands(index);
+};
+
+// Function to calculate LS median
+var LSMed = function(d, ROI, days){
+  var start = ee.Date(d).advance(ee.Number(days).multiply(-1), 'day');
+  var end = ee.Date(d).advance(ee.Number(days), 'day');
+  
+  var LS8Col = ee.ImageCollection(LS8)
+    .filterBounds(ROI)
+    .filterDate(start, end)
+    .map(function(img) {return maskIm(img);})
+    .map(function(img) {return DI_LS8(img);})
+    .select(['MNDWI']); 
+
+  var LS7Col = ee.ImageCollection(LS7)
+    .filterBounds(ROI)
+    .filterDate(start, end)
+    .map(function(img) {return maskIm(img);})
+    .map(function(img) {return DI_LS7(img);})
+    .select(['MNDWI']); 
+  var LS = LS8Col.merge(LS7Col);
+  return(ee.ImageCollection(LS).median());
+};
+
+// Function to generate a gap-filled MNDWI image 
+// Fill image is the median of the median images for the same month 2007-2016
+var landsat_process = function(d, ROI){
+  var date = ee.Date.parse('yyyy-MM-dd', d);
+  var month = date.get('month');
+  var yrs = ee.List.sequence(2007,2016);
+  var dates = yrs.map(function(y) {return ee.Date.fromYMD(ee.Number(y), month, 15);});
+  var col = dates.map(function(d) {return LSMed(d, ROI, 15);});
+  var fill = ee.ImageCollection(col).median();
+  var LS = ee.Image(LSMed(date, ROI, 15)).unmask(fill);
+  var col = dates.map(function(d) {return LSMed(d, ROI, 45);});
+  var fill = ee.ImageCollection(col).median();
+  var LS = ee.Image(LS.unmask(fill));
+  return(ee.Image(LS))
+}
+
+// -----------------------------------------------------------------
+//              Cluster Functions
+// -----------------------------------------------------------------
+// Function to make training set
+var train = function(img, clnum, clusArea){
+  var image = img.clip(clusArea);
+  var min = clnum;
+  var max = clnum;
+
+  var training_features = image.sample({
+    region:clusArea,
+    scale:10,
+    numPixels: 1e3 
+  });
+
+  var clusterer = ee.Clusterer.wekaCascadeKMeans({
+    minClusters:min,
+    maxClusters:max,
+    restarts:10,
+    init:false,
+    distanceFunction:"Euclidean",
+    maxIterations:6
+  });
+  
+  return(clusterer.train(training_features));
+};
+
+// Function to perform cluster analysis
+var clusSAR_LS = function(img, clusterer, bound){
+  var image = img.clip(bound);
+  var kmeans_image = image.cluster(clusterer); 
+  return(kmeans_image);
+};
+
+// Function to get water cluster
+var water = function(kmeans_image, lake){
+  var limit = 1000;
+  var WB = ee.Image(kmeans_image.select(['cluster'])); 
+  var clNumber = WB.sampleRegions({
+    collection: lake, 
+    scale: 10
+  })
+  .limit(limit)
+  .toList(limit)
+  .map(function(f) {return ee.Feature(f).get('cluster');})
+  .reduce(ee.Reducer.mode());
+  var WB = WB.eq(ee.Number(clNumber));
+  return(WB.updateMask(WB.eq(1)));
+}
+
+// -----------------------------------------------------------------
+//              Master Function
+// -----------------------------------------------------------------
+var getWB = function(d, clnum, bound, lake){
+  var SAR = SAR_process(Sen1, d, bound)
+  var LS = landsat_process(d, bound);
+  var img = SAR.addBands(LS.select(['MNDWI']));
+  var clusterer = train(img, clnum, bound);
+  var kmeans_image = clusSAR_LS(img, clusterer, bound);
+  var wb = water(kmeans_image, lake);
+  var kmeans_image = kmeans_image.add(ee.Number(1));
+  var kmeans_image = kmeans_image.int()
+  Map.addLayer(SAR, vis_SAR, 'SAR Composite');
+  Map.addLayer(LS.select(['MNDWI']), vis_MNDWI, 'MNDWI Composite');
+  Map.addLayer(ee.Image(kmeans_image).randomVisualizer(), {}, 'Kmeans Clusters', 1);
+  Map.addLayer(wb, vis_WB, 'Surface Water')
+  return(wb);
+};
+
+// -----------------------------------------------------------------
+//              Run Script
+// -----------------------------------------------------------------
+var date = '2016-05-15'
+var getWater = getWB(date, clnum, ROI, perm);
